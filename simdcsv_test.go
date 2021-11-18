@@ -18,9 +18,12 @@ package simdcsv
 
 import (
 	"bytes"
+	"context"
 	"encoding/csv"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"math/bits"
@@ -29,6 +32,11 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	perrors "github.com/pingcap/errors"
+	"github.com/pingcap/tidb/br/pkg/lightning/config"
+	"github.com/pingcap/tidb/br/pkg/lightning/mydump"
+	"github.com/pingcap/tidb/br/pkg/lightning/worker"
 )
 
 //
@@ -862,6 +870,99 @@ func benchmarkSimdCsv(b *testing.B, file string) {
 			log.Fatalf("%v", err)
 		}
 	}
+}
+
+type fileLikeReader struct {
+	buf []byte
+	off int64
+}
+
+func newFileLikeReader(buf []byte) io.ReadSeekCloser {
+	return &fileLikeReader{buf: buf}
+}
+
+func (f *fileLikeReader) Read(b []byte) (int, error) {
+	if f.off >= int64(len(f.buf)) {
+		return 0, io.EOF
+	}
+	n := copy(b, f.buf[f.off:])
+	f.off += int64(n)
+	return n, nil
+}
+
+func (f *fileLikeReader) Seek(offset int64, whence int) (int64, error) {
+	newOff := int64(0)
+	switch whence {
+	case io.SeekStart:
+		newOff = offset
+	case io.SeekCurrent:
+		newOff += offset
+	case io.SeekEnd:
+		newOff = int64(len(f.buf)) + offset
+	default:
+		panic(fmt.Sprintf("unknown whence: %d", whence))
+	}
+	if newOff < 0 {
+		return 0, errors.New("negative offset")
+	}
+	f.off = newOff
+	return newOff, nil
+}
+
+func (f *fileLikeReader) Close() error {
+	return nil
+}
+
+var _ io.ReadSeekCloser = &fileLikeReader{}
+
+func benchmarkLightningCsv(b *testing.B, file string) {
+	buf, err := ioutil.ReadFile(file)
+	if err != nil {
+		panic(err)
+	}
+
+	b.SetBytes(int64(len(buf)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	pool := worker.NewPool(context.Background(), 16, "parser")
+	csvCfg := &config.NewConfig().Mydumper.CSV
+	for i := 0; i < b.N; i++ {
+		parser, err := mydump.NewCSVParser(
+			csvCfg,
+			newFileLikeReader(buf),
+			int64(config.ReadBlockSize), pool, true, nil)
+		if err != nil {
+			b.Fatalf("Failed to create csv parser: %v", err)
+		}
+		for {
+			err := parser.ReadRow()
+			if err == nil {
+				continue
+			}
+			if perrors.Cause(err) == io.EOF {
+				break
+			}
+			if err != nil {
+				b.Fatalf("Failed to read row: %v", err)
+			}
+		}
+		if err := parser.Close(); err != nil {
+			b.Fatalf("Failed to close csv parser: %v", err)
+		}
+	}
+}
+
+func BenchmarkLightningCsv(b *testing.B) {
+	b.Run("parking-citations-100K", func(b *testing.B) {
+		benchmarkLightningCsv(b, "testdata/parking-citations-100K.csv")
+	})
+	b.Run("worldcitiespop-100K", func(b *testing.B) {
+		benchmarkLightningCsv(b, "testdata/worldcitiespop-100K.csv")
+	})
+	b.Run("nyc-taxi-data-100K", func(b *testing.B) {
+		benchmarkLightningCsv(b, "testdata/nyc-taxi-data-100K.csv")
+	})
 }
 
 func BenchmarkEncodingCsv(b *testing.B) {
